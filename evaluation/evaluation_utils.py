@@ -62,3 +62,62 @@ def extract_property_value(
     if not math.isfinite(value):
         return None
     return clamp(value, clamp_min, clamp_max)
+
+
+def classify_output(
+    text: str,
+    *,
+    clamp_min: float = CLAMP_MIN,
+    clamp_max: float = CLAMP_MAX,
+) -> dict[str, object]:
+    """
+    Classify one generated string, keeping the pre-clamp value.
+
+    extract_property_value() clamps silently and returns None on a parse
+    failure, so neither event can be counted downstream. This reports both
+    explicitly, which lets an evaluation state how many generations failed
+    to parse and how many were clamped, rather than dropping them quietly.
+
+    Returns the keys:
+        parse_success   whether a numeric value could be extracted
+        raw_prediction  the extracted value before clamping (None on failure)
+        was_clamped     whether raw_prediction fell outside [clamp_min, clamp_max]
+        prediction      the value after clamping (None on failure)
+        output_status   "parse_failure" | "parsed_in_range" | "parsed_out_of_range"
+    """
+    raw_prediction = extract_property_value(
+        text,
+        clamp_min=-math.inf,
+        clamp_max=math.inf,
+    )
+
+    if raw_prediction is None:
+        return {
+            "parse_success": False,
+            "raw_prediction": None,
+            "was_clamped": False,
+            "prediction": None,
+            "output_status": "parse_failure",
+        }
+
+    was_clamped = not (
+        clamp_min <= raw_prediction <= clamp_max
+    )
+
+    prediction = clamp(
+        raw_prediction,
+        clamp_min,
+        clamp_max,
+    )
+
+    return {
+        "parse_success": True,
+        "raw_prediction": raw_prediction,
+        "was_clamped": was_clamped,
+        "prediction": prediction,
+        "output_status": (
+            "parsed_out_of_range"
+            if was_clamped
+            else "parsed_in_range"
+        ),
+    }

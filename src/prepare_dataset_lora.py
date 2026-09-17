@@ -65,9 +65,13 @@ PROMPTS = {
 
 INPUT_TYPES = ["formula_pretty", "descr_1st_sentence", "descr_last", "description", "cif_structure"]
 
+# A property missing from this table gets a target with no unit at all, which
+# makes its output format differ from the other properties. Add an entry when
+# introducing a property.
 UNIT_BY_PROP = {
     "formation_energy_per_atom": "eV/atom",
     "band_gap": "eV",
+    "bulk_modulus_kv": "GPa",
 }
 
 
@@ -84,18 +88,28 @@ def build_split(
         max_words: Optional[int] = None,
         is_test: bool = False,
     ) -> Dataset:
-    df = pd.read_csv(csv_path)
+    # na_filter=False keeps the composition "NaN" (sodium nitride) as a string
+    # instead of turning it into a missing value.
+    df = pd.read_csv(csv_path, na_filter=False)
 
     # Special handling for descr_1st_sentence and descr_last: use description column
     actual_input_col = "description" if input_type in {"descr_1st_sentence", "descr_last"} else input_type
-    
+
     if actual_input_col not in df.columns:
         raise KeyError(f"Column '{actual_input_col}' not found in {csv_path}. Available: {list(df.columns)[:12]}...")
     if not is_test and prop_name not in df.columns:
         raise KeyError(f"Property column '{prop_name}' not found in {csv_path}.")
 
     use_cols = [actual_input_col] + ([] if is_test else [prop_name])
-    df = df[use_cols].dropna().reset_index(drop=True)
+    sub = df[use_cols]
+    # Filter on empty strings rather than dropna(): with na_filter=False the
+    # missing entries become "", so dropna() would not catch them. This keeps
+    # the "NaN" composition while dropping genuinely empty inputs (e.g. the
+    # 371 materials without a CIF) from that representation only.
+    mask = sub[actual_input_col].astype(str).str.strip().ne("")
+    if not is_test:
+        mask &= sub[prop_name].astype(str).str.strip().ne("")
+    df = sub[mask].reset_index(drop=True)
 
     sys_prompt, user_fn = PROMPTS[input_type]
 
@@ -106,7 +120,7 @@ def build_split(
             user_prompt = user_fn(row[actual_input_col], property_name=prop_name, max_words=max_words)
         else:
             user_prompt = user_fn(row[actual_input_col], property_name=prop_name)
-        
+
         messages = [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt},
@@ -126,6 +140,7 @@ def build_split(
             record["value"] = val
         rows.append(record)
     return Dataset.from_list(rows)
+
 
 def save_split(ds: Dataset, base_out: Path, split_name: str) -> None:
     out_dir = base_out / split_name

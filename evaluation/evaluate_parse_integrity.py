@@ -11,14 +11,33 @@ import evaluation.evaluation_utils as F
 TARGET_SPLIT = "test"
 
 MODALITIES = ("formula", "descr1st", "description", "descr_last", "cif")
-PROPERTIES = ("formation_energy_per_atom", "band_gap")
+PROPERTIES = ("formation_energy_per_atom", "band_gap", "bulk_modulus_kv")
+
+# Expected test-set sizes. MP has two, depending on the representation. The CIF
+# runs use test_fixed.csv, the repaired split: one row per material, 9,947 of
+# them, every one carrying a CIF. The other representations still run over
+# test.csv as distributed, which repeats 53 materials eight times each and so
+# has 10,318 rows for the same 9,947 materials; evaluate_metrics collapses that
+# back down by keeping the first occurrence, which is why both end up reported
+# over 9,947 materials. JARVIS (bulk modulus) uses a single test split
+# restricted to the 2,340 materials that carry an elastic tensor, so every
+# representation shares it (see data/processed/jarvis_test_labeled/test.csv).
+_MP_TEST_SIZE = {"cif": 9947}
+_MP_TEST_SIZE_DEFAULT = 10318
+_JARVIS_TEST_SIZE = 2340
 
 
 def _discover_repro_runs(runs_root: Path, split: str, require_records: bool) -> list[dict]:
     rows: list[dict] = []
+    # property_name is inferred from the directory location plus the run_id
+    # prefix. Getting this wrong scores a run against another property's
+    # ground truth: no error is raised and the resulting MAE still looks
+    # plausible. Always change this together with the writing side
+    # (scripts/*/eval_runs.sh), which decides where runs are placed.
     roots = (
         ("formation_energy_per_atom", runs_root, "G*"),
         ("band_gap", runs_root / "band_gap", "Bg*"),
+        ("bulk_modulus_kv", runs_root / "bulk_modulus_kv", "Bk*"),
     )
     for property_name, root_dir, pattern in roots:
         if not root_dir.exists():
@@ -36,7 +55,7 @@ def _discover_repro_runs(runs_root: Path, split: str, require_records: bool) -> 
             variant = "-".join(core_parts[2:])
             if modality not in MODALITIES:
                 continue
-            model_size = prefix[2:] if prefix.startswith("Bg") else prefix[1:]
+            model_size = prefix[2:] if prefix.startswith(("Bg", "Bk")) else prefix[1:]
             records_path = run_dir / split / "records.jsonl"
             records_exists = records_path.is_file()
             if require_records and not records_exists:
@@ -53,7 +72,11 @@ def _discover_repro_runs(runs_root: Path, split: str, require_records: bool) -> 
                 "split": split,
                 "records_path": str(records_path),
                 "records_exists": records_exists,
-                "expected_test_size": 10223 if modality == "cif" else 10318,
+                "expected_test_size": (
+                    _JARVIS_TEST_SIZE
+                    if property_name == "bulk_modulus_kv"
+                    else _MP_TEST_SIZE.get(modality, _MP_TEST_SIZE_DEFAULT)
+                ),
             })
     return rows
 

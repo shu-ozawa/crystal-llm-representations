@@ -13,6 +13,11 @@ from datasets import load_from_disk
 from peft import AutoPeftModelForCausalLM, PeftConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+try:  # the script is normally run by path, so src/ is on sys.path
+    from train_lora_model import fit_messages_to_max_length
+except ImportError:  # imported as part of a package
+    from src.train_lora_model import fit_messages_to_max_length
+
 ATTN_IMPLEMENTATION = "sdpa"
 
 
@@ -65,6 +70,7 @@ class RunMeta:
     dtype: str
     device: str
     created_at_unix: float
+    prompt_fitting: str = "trim_last_user_message"
 
 
 
@@ -254,6 +260,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--hidden_dtype", type=str, default="float16", choices=["float16", "float32"], help="Hidden state dtype for saving (on CPU).")
     parser.add_argument("--save_prompt_text", action="store_true")
+    parser.add_argument(
+        "--date_string",
+        type=str,
+        default="26 Jul 2024",
+        help=(
+            "Fixed 'Today Date' passed to the chat template, to match training. "
+            "Llama-3.2 templates inject the current date via strftime_now, so "
+            "pinning keeps the eval prompt identical to what the model was "
+            "trained on. Pass an empty string to disable pinning."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -283,9 +300,15 @@ def main() -> None:
     records_path = out_dir / "records.jsonl"
     meta_path = out_dir / "meta.json"
     strip_trailing_assistant = not bool(args.no_strip_trailing_assistant)
+    # Pin the chat template to the same date used during training
+    # (an empty string disables pinning).
+    date_string = args.date_string.strip() if args.date_string else ""
+    template_date_kwargs = {"date_string": date_string} if date_string else {}
+    print(f"[INFO] chat template date_string={date_string or '<disabled>'}")
     meta = RunMeta(dataset_dir=dataset_dir, split=args.split, adapter_dir=adapter_dir, model_id=model_id, base_model_id=base_model_id, max_new_tokens=int(args.max_new_tokens), max_input_length=int(args.max_input_length), stop_on_json_close=bool(args.stop_on_json_close), strip_trailing_assistant=strip_trailing_assistant, dtype=str(dtype).replace("torch.", ""), device=device_info, created_at_unix=time.time())
     write_json(meta_path, asdict(meta))
     t0 = time.time()
+    n_prompt_fitted = 0
 
     for idx in range(total):
         if (idx + 1) % 10 == 0 or idx == 0 or idx + 1 == total:
@@ -306,7 +329,18 @@ def main() -> None:
         except Exception:
             prompt_messages = messages
             dropped_gt_assistant = False
-        prompt = tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
+        # Shorten an over-long prompt the way training does: trim the end of the
+        # last user message and keep the system prompt. Left truncation in the
+        # tokenizer cuts the instruction away instead (fit_messages_to_max_length in src/train_lora_model.py).
+        prompt_messages, prompt_was_fitted = fit_messages_to_max_length(
+            prompt_messages,
+            tokenizer,
+            int(args.max_input_length),
+            date_string=date_string or None,
+            add_generation_prompt=True,
+        )
+        n_prompt_fitted += int(prompt_was_fitted)
+        prompt = tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True, **template_date_kwargs)
         res = infer_one(model=model, tokenizer=tokenizer, prompt=prompt, max_new_tokens=int(args.max_new_tokens), max_input_length=int(args.max_input_length), stop_on_json_close=bool(args.stop_on_json_close), hidden_dtype=hidden_dtype)
         hs: torch.Tensor = res.pop("hidden_last_token")
         hs_path = hidden_dir / f"{idx:08d}.pt"
@@ -317,6 +351,7 @@ def main() -> None:
             "split": args.split,
             "prompt_hash": sha256_text(prompt),
             "dropped_gt_assistant": dropped_gt_assistant,
+            "prompt_fitted": prompt_was_fitted,
             "n_messages_prompt": len(prompt_messages) if isinstance(prompt_messages, list) else None,
             "hidden_last_token_path": str(hs_path),
             "hidden_last_token_shape": list(hs.shape),
@@ -327,6 +362,7 @@ def main() -> None:
             record["prompt"] = prompt
         append_jsonl(records_path, [record])
     t1 = time.time()
+    print(f"[INFO] prompts shortened to fit {args.max_input_length} tokens: {n_prompt_fitted}/{total}")
     print(f"[INFO] Done. wall_time={t1-t0:.2f}s output_dir={out_dir}")
 
 
